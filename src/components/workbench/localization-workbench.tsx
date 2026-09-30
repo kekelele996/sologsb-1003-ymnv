@@ -15,9 +15,13 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import { analyzeDocument, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
-import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
+import {
+  buildOutboxEntry, loadBaseSegments, loadOutbox, mergeDocument, preserveTokens,
+  removeOutboxEntry, saveBaseSegments, saveOutbox, upsertOutboxEntry,
+} from '@/lib/sync'
+import type { Discussion, GlossaryTerm, HistoryEntry, OutboxEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
@@ -57,6 +61,11 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  const [online, setOnline] = useState(true)
+  const [baseSegments, setBaseSegments] = useState<Segment[]>(seedSegments)
+  const [outbox, setOutbox] = useState<OutboxEntry[]>([])
+  const [syncing, setSyncing] = useState(false)
+  const [syncFlash, setSyncFlash] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null)
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -66,24 +75,7 @@ export function LocalizationWorkbench() {
       return response.json()
     },
     initialData: seedDocument,
-  })
-  const historyQuery = useQuery({
-    queryKey: ['localization-history'],
-    queryFn: async () => {
-      const response = await fetch('/api/history')
-      if (!response.ok) throw new Error('history request failed')
-      return response.json() as Promise<HistoryEntry[]>
-    },
-    initialData: seedHistory,
-  })
-  const conflictQuery = useQuery({
-    queryKey: ['localization-conflicts'],
-    queryFn: async () => {
-      const response = await fetch('/api/conflicts')
-      if (!response.ok) throw new Error('conflicts request failed')
-      return response.json() as Promise<TranslationConflict[]>
-    },
-    initialData: seedConflicts,
+    enabled: online,
   })
 
   const checkMutation = useMutation({
@@ -135,7 +127,9 @@ export function LocalizationWorkbench() {
   const progress = segments.length ? Math.round((confirmedCount / segments.length) * 100) : 0
   const filteredGlossary = glossary.filter((term) => `${term.source} ${term.target}`.toLowerCase().includes(glossarySearch.toLowerCase()))
   const selectedDiscussions = discussions.filter((discussion) => discussion.segmentId === selectedSegment?.id)
-  const mockConnected = documentQuery.isFetched && historyQuery.isFetched && conflictQuery.isFetched
+  const pendingCount = outbox.filter((entry) => entry.status === 'pending').length
+  const failedCount = outbox.filter((entry) => entry.status === 'failed').length
+  const queuedSegments = outbox.map((entry) => ({ entry, segment: segments.find((item) => item.id === entry.segmentId) }))
 
   useEffect(() => {
     if (hydrated) return
@@ -150,9 +144,30 @@ export function LocalizationWorkbench() {
           setHistory(draft.history ?? seedHistory)
         }
       }
+      const storedOutbox = loadOutbox()
+      if (storedOutbox.length) setOutbox(storedOutbox)
+      setBaseSegments(loadBaseSegments(seedSegments))
+      const storedOnline = localStorage.getItem('sologsb-1003-online')
+      if (storedOnline !== null) setOnline(storedOnline === 'true')
+      else if (typeof navigator !== 'undefined') setOnline(navigator.onLine)
     } catch { /* start from seed */ }
     setHydrated(true)
   }, [hydrated])
+
+  useEffect(() => {
+    if (!hydrated) return
+    saveOutbox(outbox)
+  }, [hydrated, outbox])
+
+  useEffect(() => {
+    if (!hydrated) return
+    saveBaseSegments(baseSegments)
+  }, [hydrated, baseSegments])
+
+  useEffect(() => {
+    if (!hydrated) return
+    try { localStorage.setItem('sologsb-1003-online', String(online)) } catch { /* storage unavailable */ }
+  }, [hydrated, online])
 
   useEffect(() => {
     if (!hydrated) return
@@ -184,6 +199,13 @@ export function LocalizationWorkbench() {
   const updateTarget = (segment: Segment, targetText: string) => {
     const next = segments.map((item) => item.id === segment.id ? { ...item, targetText, status: item.status === 'confirmed' ? 'draft' as const : item.status } : item)
     replaceState({ segments: next, discussions: clone(discussions) })
+    const baseText = baseSegments.find((item) => item.id === segment.id)?.targetText ?? ''
+    setOutbox((current) => {
+      const previous = current.find((item) => item.segmentId === segment.id)
+      const entry = buildOutboxEntry({ ...segment, targetText }, baseText, previous)
+      if (!entry) return current.filter((item) => item.segmentId !== segment.id)
+      return upsertOutboxEntry(current, entry)
+    })
   }
   const updateStatus = (segmentId: string, status: SegmentStatus, action: HistoryEntry['action'] = status === 'confirmed' ? 'confirm' : 'return') => {
     const segment = segments.find((item) => item.id === segmentId)
@@ -241,13 +263,146 @@ export function LocalizationWorkbench() {
     setSelectedForReturn(new Set())
   }
   const resolveConflict = (conflict: TranslationConflict, strategy: 'local' | 'remote') => {
-    const targetText = strategy === 'local' ? conflict.localText : conflict.remoteText
     const segment = segments.find((item) => item.id === conflict.segmentId)
+    const outboxEntry = outbox.find((item) => item.segmentId === conflict.segmentId)
+    let targetText = conflict.localText
+    if (strategy === 'remote') {
+      // Adopt the colleague's version, but never let it wash away protected tokens.
+      const { text } = preserveTokens(conflict.remoteText, segment?.sourceText ?? '', conflict.baseText ?? '')
+      targetText = text
+      if (outboxEntry) {
+        setBaseSegments((current) => current.map((item) => item.id === conflict.segmentId ? { ...item, targetText: text } : item))
+        setOutbox((current) => removeOutboxEntry(current, conflict.segmentId))
+      }
+    } else if (outboxEntry) {
+      // Keep the local edit and make sure it is queued for the next push.
+      setOutbox((current) => upsertOutboxEntry(current, { ...outboxEntry, status: 'pending', attempts: 0, lastError: undefined }))
+    }
     const next = segments.map((item) => item.id === conflict.segmentId ? { ...item, targetText, status: 'draft' as const } : item)
     replaceState({ segments: next, discussions: clone(discussions) })
     if (segment) pushHistoryEntry(segment.id, 'resolve-conflict', segment.targetText, targetText, strategy === 'local' ? '保留本地' : conflict.remoteAuthor)
     setConflicts((current) => current.filter((item) => item.id !== conflict.id))
   }
+
+  const syncNow = async () => {
+    if (syncing) return
+    setSyncFlash(null)
+    if (!online) {
+      saveOutbox(outbox)
+      setSyncFlash({ type: 'info', message: `离线模式：${outbox.length} 条改动已暂存本地，恢复联网后将自动与远端对账合并。` })
+      return
+    }
+    setSyncing(true)
+    try {
+      // 1. Pull the current remote document.
+      const response = await fetch('/api/document')
+      if (!response.ok) throw new Error('无法获取远端文档')
+      const remoteDoc = await response.json() as { segments: Segment[] }
+      const remoteSegments = remoteDoc.segments
+
+      // 2. Reconcile local edits with the remote, segment by segment.
+      const { segments: merged, conflicts: newConflicts, stats } = mergeDocument(baseSegments, segments, remoteSegments)
+      setSegments(merged)
+      setConflicts((current) => {
+        const existing = new Set(current.map((item) => item.segmentId))
+        return [...newConflicts.filter((item) => !existing.has(item.segmentId)), ...current]
+      })
+      const conflictSegmentIds = new Set([...newConflicts.map((item) => item.segmentId), ...conflicts.map((item) => item.segmentId)])
+
+      // 3. Push only the entries that are not waiting on a conflict resolution.
+      const pushable = outbox.filter((entry) =>
+        (entry.status === 'pending' || entry.status === 'failed') && !conflictSegmentIds.has(entry.segmentId))
+      let accepted = 0
+      let rejected = 0
+      let requeued = 0
+      const rejectedIds = new Set<string>()
+      let nextOutbox = [...outbox]
+      if (pushable.length) {
+        const pushResponse = await fetch('/api/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: seedDocument.id, entries: pushable }),
+        })
+        if (!pushResponse.ok) throw new Error('同步推送失败')
+        const pushResult = await pushResponse.json() as { results: { segmentId: string; status: 'accepted' | 'rejected' | 'conflict'; remoteText?: string; remoteAuthor?: string; message?: string }[] }
+        for (const result of pushResult.results) {
+          const entry = nextOutbox.find((item) => item.segmentId === result.segmentId)
+          const mergedSegment = merged.find((item) => item.id === result.segmentId)
+          if (result.status === 'accepted') {
+            accepted++
+            nextOutbox = nextOutbox.filter((item) => item.segmentId !== result.segmentId)
+          } else if (result.status === 'rejected') {
+            rejected++
+            rejectedIds.add(result.segmentId)
+            // Roll back only this segment to its pre-merge (offline) text,
+            // re-applying token preservation so placeholders/links survive.
+            const { text } = preserveTokens(entry?.localText ?? mergedSegment?.targetText ?? '', mergedSegment?.sourceText ?? '', entry?.baseText ?? '')
+            setSegments((current) => current.map((item) => item.id === result.segmentId ? { ...item, targetText: text, status: 'draft' as const } : item))
+            nextOutbox = nextOutbox.map((item) => item.segmentId === result.segmentId
+              ? { ...item, status: 'failed' as const, attempts: item.attempts + 1, lastError: result.message ?? '远端拒绝了该片段' }
+              : item)
+          } else if (result.status === 'conflict') {
+            requeued++
+            conflictSegmentIds.add(result.segmentId)
+            setConflicts((current) => [
+              { id: `sync-${result.segmentId}-${Date.now()}`, segmentId: result.segmentId, baseText: entry?.baseText, localText: entry?.localText ?? '', remoteText: result.remoteText ?? '', remoteAuthor: result.remoteAuthor ?? '远端协作者', createdAt: Date.now() },
+              ...current.filter((item) => item.segmentId !== result.segmentId),
+            ])
+            nextOutbox = nextOutbox.map((item) => item.segmentId === result.segmentId
+              ? { ...item, status: 'pending' as const, attempts: item.attempts + 1 }
+              : item)
+          }
+        }
+      }
+
+      // 4. Advance the merge base for every synced segment; conflicts and
+      //    rejected segments keep their old base so they can be retried.
+      setBaseSegments((current) => {
+        const baseMap = new Map(current.map((item) => [item.id, item]))
+        return merged.map((segment) => {
+          if (conflictSegmentIds.has(segment.id) || rejectedIds.has(segment.id)) return baseMap.get(segment.id) ?? segment
+          return { ...segment }
+        })
+      })
+      setOutbox(nextOutbox)
+      saveOutbox(nextOutbox)
+
+      setSyncFlash({
+        type: rejected ? 'error' : 'success',
+        message: `同步完成：${stats.autoMergedLocal} 条采用本地、${stats.autoMergedRemote} 条采用远端、${stats.conflicts} 条待你选择；推送 ${accepted} 条成功、${rejected} 条被远端退回${rejected ? '（已退回合并前状态，保留在本地队列，可重试）' : ''}、${requeued} 条重新排队。`,
+      })
+    } catch (error) {
+      setSyncFlash({ type: 'error', message: `同步失败：${(error as Error).message}。改动仍保留在本地，下次联网自动重试。` })
+    } finally {
+      setSyncing(false)
+    }
+  }
+
+  const toggleOnline = () => {
+    const next = !online
+    setOnline(next)
+    if (!next) {
+      setSyncFlash({ type: 'info', message: `已进入离线模式：${outbox.length} 条改动暂存本地，恢复联网后自动与远端对账合并。` })
+    }
+  }
+
+  const simulateRemoteEdit = async () => {
+    try {
+      const response = await fetch('/api/simulate-remote-edit', { method: 'POST' })
+      if (!response.ok) throw new Error('模拟失败')
+      setSyncFlash({ type: 'info', message: '已模拟同事修改远端文档。可在离线改稿后联网，观察两边改动的对账合并。' })
+    } catch (error) {
+      setSyncFlash({ type: 'error', message: `模拟远端修改失败：${(error as Error).message}` })
+    }
+  }
+
+  const prevOnlineRef = useRef(online)
+  useEffect(() => {
+    if (online && !prevOnlineRef.current) {
+      void syncNow()
+    }
+    prevOnlineRef.current = online
+  }, [online])
   const importMarkdown = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (!file) return
@@ -301,8 +456,12 @@ export function LocalizationWorkbench() {
             <div className="min-w-0"><h1 className="truncate font-semibold tracking-tight">开源文档本地化工作台</h1><p className="truncate text-[11px] text-slate-400">{documentQuery.data.sourceFile} · {documentQuery.data.title}</p></div>
           </div>
           <div className="hidden items-center gap-2 md:flex">
-            <Badge className={cn(mockConnected ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300', 'border-0')}>{mockConnected ? <Cloud className="mr-1 h-3 w-3" /> : <CloudOff className="mr-1 h-3 w-3" />}{mockConnected ? 'MSW 已连接' : '连接模拟接口'}</Badge>
+            <button type="button" onClick={toggleOnline} title="点击切换联网 / 离线模拟" className={cn('flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium transition', online ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25' : 'bg-amber-500/15 text-amber-300 hover:bg-amber-500/25')}>
+              {online ? <Cloud className="h-3 w-3" /> : <CloudOff className="h-3 w-3" />}
+              {online ? '在线 · 可同步' : '离线 · 改动暂存本地'}
+            </button>
             <Badge className={cn('border-0', dirty ? 'bg-amber-500/15 text-amber-300' : 'bg-slate-700 text-slate-200')}>{saveMutation.isPending ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <Save className="mr-1 h-3 w-3" />}{saveMutation.isPending ? '保存中' : dirty ? '草稿未保存' : '已持久化'}</Badge>
+            {outbox.length > 0 && <Badge className={cn('border-0', failedCount ? 'bg-red-500/20 text-red-200' : 'bg-blue-500/20 text-blue-200')}><RefreshCw className="mr-1 h-3 w-3" />待同步 {outbox.length}{failedCount ? ` · 失败 ${failedCount}` : ''}</Badge>}
           </div>
           <div className="header-actions ml-auto flex items-center gap-2">
             <Tabs value={mode} onValueChange={(value) => setMode(value as 'translate' | 'review')}><TabsList className="bg-slate-800"><TabsTrigger value="translate" className="text-slate-300 data-[state=active]:bg-blue-600 data-[state=active]:text-white">翻译</TabsTrigger><TabsTrigger value="review" className="text-slate-300 data-[state=active]:bg-blue-600 data-[state=active]:text-white">审校</TabsTrigger></TabsList></Tabs>
@@ -310,7 +469,9 @@ export function LocalizationWorkbench() {
             <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={redo} disabled={!future.length}><RotateCw className="h-4 w-4" />重做</Button>
             <input ref={fileInput} type="file" accept=".md,.markdown,text/markdown" className="hidden" onChange={(event) => void importMarkdown(event)} />
             <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => fileInput.current?.click()}><Import className="h-4 w-4" />导入</Button>
-            <Button size="sm" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}><Save className="h-4 w-4" />保存</Button>
+            <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={simulateRemoteEdit} title="模拟同事修改远端文档，用于演示对账合并"><GitCompare className="h-4 w-4" />模拟远端改动</Button>
+            <Button size="sm" onClick={() => void syncNow()} disabled={syncing || !online} title={online ? '与远端对账并合并本地改动' : '离线中，改动已暂存本地'}><RefreshCw className={cn('h-4 w-4', syncing && 'animate-spin')} />{syncing ? '同步中…' : '同步'}{outbox.length > 0 ? ` (${outbox.length})` : ''}</Button>
+            <Button size="sm" variant="secondary" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}><Save className="h-4 w-4" />保存</Button>
           </div>
         </div>
       </header>
@@ -326,6 +487,19 @@ export function LocalizationWorkbench() {
           <Button size="sm" variant="outline" onClick={exportMarkdown}><Download className="h-4 w-4" />导出译文</Button>
         </div>
       </div>
+
+      {syncFlash && (
+        <div className={cn('border-b px-4 py-2 text-xs backdrop-blur lg:px-6',
+          syncFlash.type === 'success' && 'border-emerald-200 bg-emerald-50 text-emerald-800',
+          syncFlash.type === 'error' && 'border-red-200 bg-red-50 text-red-800',
+          syncFlash.type === 'info' && 'border-blue-200 bg-blue-50 text-blue-800')}>
+          <div className="mx-auto flex max-w-[1800] items-center gap-2">
+            {syncFlash.type === 'success' ? <CheckCheck className="h-4 w-4 shrink-0" /> : syncFlash.type === 'error' ? <AlertCircle className="h-4 w-4 shrink-0" /> : <Cloud className="h-4 w-4 shrink-0" />}
+            <span className="flex-1">{syncFlash.message}</span>
+            <button type="button" onClick={() => setSyncFlash(null)} className="rounded p-0.5 hover:bg-black/5" aria-label="关闭"><X className="h-3.5 w-3.5" /></button>
+          </div>
+        </div>
+      )}
 
       <main className="workbench-grid mx-auto grid max-w-[1800px] grid-cols-[270px_minmax(620px,1fr)_340px] gap-4 p-4 lg:p-5">
         <aside className="workbench-left space-y-4">
@@ -405,7 +579,7 @@ export function LocalizationWorkbench() {
         <aside className="workbench-right min-w-0">
           <Card className="sticky top-[74px] max-h-[calc(100vh-96px)] overflow-hidden">
             <Tabs defaultValue="discussion" className="flex h-full flex-col">
-              <TabsList className="mx-3 mt-3 grid grid-cols-4"><TabsTrigger id="discussion-tab" value="discussion" className="px-1 text-[11px]">讨论</TabsTrigger><TabsTrigger value="issues" className="px-1 text-[11px]">问题</TabsTrigger><TabsTrigger value="history" className="px-1 text-[11px]">历史</TabsTrigger><TabsTrigger value="conflicts" className="px-1 text-[11px]">冲突 {conflicts.length ? `(${conflicts.length})` : ''}</TabsTrigger></TabsList>
+              <TabsList className="mx-3 mt-3 grid grid-cols-5"><TabsTrigger id="discussion-tab" value="discussion" className="px-1 text-[11px]">讨论</TabsTrigger><TabsTrigger value="issues" className="px-1 text-[11px]">问题</TabsTrigger><TabsTrigger value="history" className="px-1 text-[11px]">历史</TabsTrigger><TabsTrigger value="conflicts" className="px-1 text-[11px]">冲突 {conflicts.length ? `(${conflicts.length})` : ''}</TabsTrigger><TabsTrigger value="queue" className="px-1 text-[11px]">队列 {outbox.length ? `(${outbox.length})` : ''}</TabsTrigger></TabsList>
               <TabsContent value="discussion" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3">
                 <div className="rounded-lg border border-blue-100 bg-blue-50/60 p-2.5"><p className="text-[10px] font-semibold text-blue-800">当前片段 #{selectedSegment?.index}</p><p className="mt-1 line-clamp-3 text-xs leading-5 text-blue-700">{selectedSegment?.targetText || selectedSegment?.sourceText}</p></div>
                 <div className="mt-3 flex gap-2"><Textarea value={discussionDraft} onChange={(event) => setDiscussionDraft(event.target.value)} rows={2} placeholder="针对当前句子留下讨论…" className="text-xs" /><Button size="icon" className="h-auto self-stretch" onClick={addDiscussion}><Send className="h-4 w-4" /></Button></div>
@@ -414,6 +588,25 @@ export function LocalizationWorkbench() {
               <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
               <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
               <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200"><div className="bg-red-50 px-3 py-2"><b className="text-xs text-red-800">片段 #{segments.find((item) => item.id === conflict.segmentId)?.index} 存在并发修改</b><p className="mt-1 text-[10px] text-red-600">{conflict.remoteAuthor} 修改了同一句</p></div><div className="space-y-2 p-3"><div><span className="text-[9px] font-semibold text-slate-400">本地版本</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div><div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div></div></div>)}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
+              <TabsContent value="queue" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3">
+                <div className="mb-3 flex items-center justify-between">
+                  <p className="text-[11px] text-slate-500">离线改动先攒在本地，联网后按片段与远端对账合并；被远端退回的片段只回退自身，其余保持同步。</p>
+                  <Button size="sm" variant="outline" className="shrink-0" onClick={() => void syncNow()} disabled={syncing || !online}><RefreshCw className={cn('h-3.5 w-3.5', syncing && 'animate-spin')} />重试全部</Button>
+                </div>
+                <div className="space-y-2">
+                  {queuedSegments.map(({ entry, segment }) => (
+                    <div key={entry.segmentId} className={cn('rounded-lg border p-2.5', entry.status === 'failed' ? 'border-red-200 bg-red-50/50' : 'border-slate-200 bg-slate-50/60')}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-semibold text-slate-700">#{segment?.index ?? '—'} {segment ? kindLabel[segment.kind] : ''}</span>
+                        <Badge variant={entry.status === 'failed' ? 'destructive' : 'secondary'}>{entry.status === 'failed' ? '同步失败' : '待同步'}{entry.attempts > 0 ? ` · 第 ${entry.attempts} 次` : ''}</Badge>
+                      </div>
+                      <p className="mt-1.5 line-clamp-2 text-[11px] leading-5 text-slate-600">{entry.localText || segment?.sourceText}</p>
+                      {entry.status === 'failed' && entry.lastError && <p className="mt-1.5 flex items-start gap-1 text-[10px] text-red-600"><AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />{entry.lastError}</p>}
+                    </div>
+                  ))}
+                  {!queuedSegments.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />没有待同步的改动</div>}
+                </div>
+              </TabsContent>
             </Tabs>
           </Card>
           <div className="mt-3 rounded-xl border bg-slate-950 px-3 py-3 text-[10px] text-slate-400"><p className="mb-2 font-semibold text-slate-200">键盘操作</p><div className="grid grid-cols-2 gap-2"><span><kbd>J</kbd> 下一问题</span><span><kbd>K</kbd> 上一问题</span><span><kbd>C</kbd> 确认</span><span><kbd>R</kbd> 退回</span><span><kbd>⌘ Z</kbd> 撤销</span><span><kbd>⌘ ⇧ Z</kbd> 重做</span></div></div>

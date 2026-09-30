@@ -57,6 +57,37 @@ export interface TranslationConflict {
   remoteText: string
   remoteAuthor: string
   createdAt: number
+  baseText?: string
+}
+
+/** A single offline edit queued locally until the network recovers. */
+export interface OutboxEntry {
+  segmentId: string
+  /** Segment text at the last successful sync — the three-way merge base. */
+  baseText: string
+  /** The translator's offline edit (raw, before token-safe merge). */
+  localText: string
+  status: 'pending' | 'failed'
+  attempts: number
+  lastError?: string
+  queuedAt: number
+}
+
+/** Per-segment result returned by the remote after a sync push. */
+export type SyncResultStatus = 'accepted' | 'rejected' | 'conflict'
+
+export interface SyncResult {
+  segmentId: string
+  status: SyncResultStatus
+  remoteText?: string
+  remoteAuthor?: string
+  reason?: string
+  message?: string
+}
+
+export interface SyncResponse {
+  syncedAt: number
+  results: SyncResult[]
 }
 
 export interface LocalizationDocument {
